@@ -236,12 +236,12 @@ async def test_get_financials_statement_read_api_error(mock_to_thread: AsyncMock
 
 
 @pytest.mark.asyncio
-@patch("yfmcp.server.yf.Ticker")
+@patch("yfmcp.server.yfcache.Ticker")
 @patch("yfmcp.server.asyncio.to_thread")
-async def test_get_price_history_returns_markdown_table_when_chart_type_is_none(
+async def test_get_price_history_returns_json_when_chart_type_is_none(
     mock_to_thread: AsyncMock, mock_ticker: MagicMock
 ) -> None:
-    """Test price history without chart_type returns DataFrame markdown output."""
+    """Test price history without chart_type returns JSON array of OHLCV records."""
     df = pd.DataFrame(
         {
             "Open": [100.0],
@@ -260,11 +260,15 @@ async def test_get_price_history_returns_markdown_table_when_chart_type_is_none(
     result = await get_price_history("AAPL", "1mo", "1d", None)
 
     assert isinstance(result, str)
-    assert result == df.to_markdown()
-    assert "Open" in result
-    assert "Close" in result
-    assert "|" in result
-    mock_ticker_obj.history.assert_called_once_with(period="1mo", interval="1d", prepost=False, rounding=True)
+    data = json.loads(result)
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["Open"] == 100.0
+    assert data[0]["Close"] == 105.0
+    assert "Open" in data[0]
+    assert "Close" in data[0]
+    assert "|" not in result
+    mock_ticker_obj.history.assert_called_once_with(period="1mo", interval="1d", rounding=True)
 
 
 @pytest.mark.asyncio

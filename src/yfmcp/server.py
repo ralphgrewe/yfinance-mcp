@@ -4,6 +4,7 @@ from typing import Annotated
 from typing import Any
 
 import yfinance as yf
+import yfinance_cache as yfcache
 from loguru import logger
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent
@@ -142,7 +143,7 @@ async def get_ticker_info(
     Note: Available fields vary by security type. Timestamps are converted to readable dates.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
         info = await asyncio.to_thread(lambda: ticker.info)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching ticker info for '{symbol}'", exc, {"symbol": symbol})
@@ -207,8 +208,9 @@ async def get_ticker_news(
     Use this to track company announcements, market sentiment, and breaking news.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        news = await asyncio.to_thread(ticker.get_news)
+        # yfcache.Ticker exposes news as a property (not a method like yf.Ticker.get_news)
+        ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
+        news = await asyncio.to_thread(lambda: ticker.news)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching news for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -622,7 +624,7 @@ async def get_price_history(
 ) -> str | ImageContent:
     """Fetch historical price data and optionally generate technical analysis charts.
 
-    When chart_type is None, returns Markdown table with columns:
+    When chart_type is None, returns JSON array of OHLCV records with fields:
     - Date: Trading date (index)
     - Open: Opening price
     - High: Highest price
@@ -643,14 +645,24 @@ async def get_price_history(
     only work with short periods (1d, 5d).
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        df = await asyncio.to_thread(
-            ticker.history,
-            period=period,
-            interval=interval,
-            prepost=prepost,
-            rounding=True,
-        )
+        if prepost:
+            # yfcache does not support pre/post market data; fall back to plain yfinance
+            ticker = await asyncio.to_thread(yf.Ticker, symbol)
+            df = await asyncio.to_thread(
+                ticker.history,
+                period=period,
+                interval=interval,
+                prepost=prepost,
+                rounding=True,
+            )
+        else:
+            ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
+            df = await asyncio.to_thread(
+                ticker.history,
+                period=period,
+                interval=interval,
+                rounding=True,
+            )
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(
             f"fetching price history for '{symbol}'",
@@ -682,7 +694,7 @@ async def get_price_history(
         )
 
     if chart_type is None:
-        return df.to_markdown()
+        return dump_json(df.reset_index().to_dict(orient="records"))
 
     return generate_chart(symbol=symbol, df=df, chart_type=chart_type)
 
@@ -715,7 +727,11 @@ async def get_financials(
     Use the data to analyze trends, calculate ratios, or compare periods.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        # yfcache does not have ttm_income_stmt; fall back to plain yfinance for ttm frequency
+        if frequency == "ttm":
+            ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        else:
+            ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching financials for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -903,7 +919,7 @@ async def get_option_chain(
     Use this to analyze options pricing, IV surfaces, and strike levels.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching options for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
@@ -987,7 +1003,7 @@ async def get_option_dates(
     the options chain for a specific date.
     """
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
         dates = await asyncio.to_thread(lambda: ticker.options)
     except Exception as exc:
         return _create_option_dates_fetch_error(
@@ -1078,7 +1094,7 @@ async def get_holders(
         )
 
     try:
-        ticker = await asyncio.to_thread(yf.Ticker, symbol)
+        ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
     except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
         return _create_retryable_error_response(f"fetching holders for '{symbol}'", exc, {"symbol": symbol})
     except Exception as exc:
