@@ -22,6 +22,33 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 - **Chart Generation** — Candlestick, VWAP, and volume profile charts returned as WebP images
 - **Options Data** — Option chains with calls, puts, strike prices, IV, and expiration dates
 - **Ownership Data** — Major holders, institutional investors, mutual fund holders, and insider transactions
+- **Multi-Provider** — Automatic fallback chain across yfinance → onvista → EODHD for better EU/German small-cap coverage
+
+## Multi-Provider Data Sources
+
+Three data sources are supported with automatic fallback:
+
+| Priority | Provider  | Best for                                        | Config                    |
+|----------|-----------|-------------------------------------------------|---------------------------|
+| 1        | yfinance  | US stocks, major EU blue chips, broad coverage  | Built-in (always enabled) |
+| 2        | onvista   | German/EU small caps, XETRA-listed stocks       | Built-in (always enabled) |
+| 3        | eodhd     | Fallback fundamentals                           | Set `EODHD_API_KEY` env var |
+
+The tools `yfinance_get_ticker_info`, `yfinance_get_price_history`, and `yfinance_get_financials` accept an optional `data_source` parameter:
+- `"auto"` (default) — tries providers in priority order, returns first successful result
+- `"yfinance"` — query yfinance only
+- `"onvista"` — query onvista only (good for EU small caps like `AJ91.F`)
+- `"eodhd"` — query EODHD only (requires `EODHD_API_KEY`)
+
+Every response includes a `_provider` field indicating which data source was used.
+
+### Environment Variables
+
+| Variable         | Default                    | Description                        |
+|------------------|----------------------------|------------------------------------|
+| `EODHD_API_KEY`  | (unset)                    | Enables EODHD provider             |
+| `PROVIDER_ORDER` | `yfinance,onvista,eodhd`   | Comma-separated priority order     |
+| `ONVISTA_DELAY`  | `0.3`                      | Rate-limiting delay for onvista    |
 
 ## Tools
 
@@ -31,9 +58,10 @@ Retrieve comprehensive stock data including company info, financials, trading me
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `GOOGL`, `MSFT`) |
+| `symbol` | string | Yes | Stock ticker symbol (e.g. `AAPL`, `GOOGL`, `AJ91.F`) |
+| `data_source` | string | No | `"auto"` (default), `"yfinance"`, `"onvista"`, or `"eodhd"` |
 
-**Returns:** JSON object with company details, price data, valuation metrics, trading info, dividends, financials, and performance indicators.
+**Returns:** JSON object with company details, price data, valuation metrics, trading info, dividends, financials, and performance indicators. Includes `_provider` field.
 
 ### `yfinance_get_ticker_news`
 
@@ -223,6 +251,83 @@ uv sync
 ```
 
 Replace `/path/to/yfinance-mcp` with the actual path to your cloned repository.
+
+### Running as a systemd Service (Debian / Ubuntu)
+
+This setup runs `yfmcp` as a long-lived HTTP server managed by systemd. A dedicated system user with a home directory is created so that `yfinance-cache` can persist its SQLite database across restarts.
+
+#### 1. Install uv system-wide
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sudo sh
+```
+
+Confirm the binary is at `/usr/local/bin/uvx` (or adjust `ExecStart` in the unit file accordingly):
+
+```bash
+which uvx
+```
+
+#### 2. Create the service user
+
+```bash
+sudo useradd --system --create-home --home-dir /home/finance-services --shell /usr/sbin/nologin finance-services
+```
+
+The user is named `finance-services` rather than something service-specific because it is intended to be shared across multiple services that use `yfinance-cache`. This way all services read from and write to the same cache database (`~/.cache/py-yfinance/`), avoiding redundant downloads and keeping data consistent. The `--create-home` flag is required to provide that writable cache location.
+
+> **Note:** If the `finance-services` user already exists (created by another service), skip this step.
+
+#### 3. Install the systemd unit
+
+Copy the provided `yfinance-mcp.service` file to the systemd directory and enable it:
+
+```bash
+sudo cp yfinance-mcp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now yfinance-mcp
+```
+
+#### 4. Verify
+
+```bash
+sudo systemctl status yfinance-mcp
+# Follow logs:
+sudo journalctl -u yfinance-mcp -f
+```
+
+The server listens on `http://0.0.0.0:8000` by default. To change the host or port, edit the `Environment=` lines in the unit file and run `sudo systemctl restart yfinance-mcp`.
+
+#### Pinning a version
+
+By default, the unit file uses `yfmcp@latest`. To pin to a specific release, edit `ExecStart` in `/etc/systemd/system/yfinance-mcp.service`:
+
+```ini
+ExecStart=/usr/local/bin/uvx yfmcp@0.11.3
+```
+
+Then reload:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart yfinance-mcp
+```
+
+#### Connecting an MCP client
+
+Point your MCP client at the running server using the `streamable-http` transport:
+
+```json
+{
+  "mcpServers": {
+    "yfmcp": {
+      "transport": "streamable-http",
+      "url": "http://<server-ip>:8000/mcp"
+    }
+  }
+}
+```
+
+---
 
 ### Testing with Codex CLI
 

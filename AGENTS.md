@@ -1,19 +1,35 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/yfmcp/server.py`: FastMCP server, tool registration, and async wrappers around `yfinance` calls.
+- `src/yfmcp/server.py`: FastMCP server, tool registration. Routes requests through `ProviderRegistry`.
 - `src/yfmcp/chart.py`: chart generation (`price_volume`, `vwap`, `volume_profile`) and WebP image encoding.
-- `src/yfmcp/types.py`: shared Literal types (`SearchType`, `TopType`, `Period`, `Interval`, `ChartType`, `ErrorCode`).
+- `src/yfmcp/types.py`: shared Literal types (`SearchType`, `TopType`, `Period`, `Interval`, `ChartType`, `ErrorCode`, `DataSource`).
 - `src/yfmcp/utils.py`: JSON helpers, including `create_error_response()`.
-- `tests/`: async pytest suite for server tools, charts, and type behavior.
-- `README.md`: end-user setup and usage guide. Demo chatbot link points to the dedicated `yfinance-mcp-demo` repository.
+- `src/yfmcp/providers/`: multi-provider data source layer.
+  - `base.py`: `BaseProvider` Protocol, `ProviderExhaustedError`.
+  - `registry.py`: `ProviderRegistry` — auto-fallback chain and direct source selection.
+  - `yfinance_provider.py`: wraps yfinance/yfcache (default provider).
+  - `onvista_provider.py`: wraps pyonvista-v2 (UNOFFICIAL_API) — German/EU small caps.
+  - `eodhd_provider.py`: wraps EODHD REST API — key-gated via `EODHD_API_KEY` env var.
+- `tests/`: async pytest suite for server tools, charts, providers, registry, and type behavior.
+- `README.md`: end-user setup and usage guide.
 
 ## Architecture Overview
 - MCP tools are exposed from `yfmcp.server` with `yfinance_`-prefixed names:
   `yfinance_get_ticker_info`, `yfinance_get_ticker_news`, `yfinance_search`, `yfinance_get_top`, `yfinance_get_price_history`, `yfinance_get_financials`, `yfinance_get_holders`, `yfinance_get_option_chain`, `yfinance_get_option_dates`.
-- All blocking `yfinance` operations MUST be wrapped with `asyncio.to_thread()`.
+- `yfinance_get_ticker_info`, `yfinance_get_price_history`, `yfinance_get_financials` accept an optional `data_source` parameter (`"auto"` | `"yfinance"` | `"onvista"` | `"eodhd"`). Default is `"auto"` (fallback chain).
+- All blocking operations MUST be wrapped with `asyncio.to_thread()` (at the provider layer).
+- **Provider contract**: providers return `None` when they have no data (signals registry to try next). Exceptions are caught internally and also yield `None`. Structured error responses are only emitted by `server.py` after all providers are exhausted (`ProviderExhaustedError`).
 - Errors MUST be returned via `create_error_response()` with structured JSON (`error`, `error_code`, optional `details`).
-- Chart responses are returned as base64-encoded WebP `ImageContent`; tabular history uses Markdown tables.
+- Chart responses are returned as base64-encoded WebP `ImageContent`; tabular history uses JSON arrays.
+- Every successful tool response includes a top-level `_provider` field (e.g. `"yfinance"`, `"onvista"`) indicating which source was used.
+
+## Provider Configuration
+| Variable         | Default                        | Description                               |
+|------------------|--------------------------------|-------------------------------------------|
+| `EODHD_API_KEY`  | (unset)                        | If unset, eodhd provider is disabled      |
+| `PROVIDER_ORDER` | `yfinance,onvista,eodhd`       | Comma-separated priority order            |
+| `ONVISTA_DELAY`  | `0.3`                          | Request delay in seconds for onvista      |
 
 ## Build, Test, and Development Commands
 - `uv sync`: install runtime dependencies.

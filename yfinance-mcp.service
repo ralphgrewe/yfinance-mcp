@@ -1,0 +1,38 @@
+[Unit]
+Description=Yahoo Finance MCP Server (yfmcp)
+Documentation=https://github.com/narumiruna/yfinance-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finance-services
+Group=finance-services
+
+# Ensure the home directory is used so yfinance-cache can store its database.
+# The finance-services user is shared across multiple services that rely on
+# yfinance-cache, so they all benefit from a single shared cache location.
+WorkingDirectory=/home/finance-services
+
+# Transport and bind configuration
+Environment=MCP_TRANSPORT=streamable-http
+Environment=FASTMCP_HOST=0.0.0.0
+Environment=FASTMCP_PORT=8000
+
+# Run via uvx — downloads and caches yfmcp in the service user's home dir.
+# To pin a version, replace "yfmcp@latest" with e.g. "yfmcp@0.11.3".
+ExecStart=/usr/local/bin/uvx yfmcp@latest
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Harden the service
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/finance-services
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

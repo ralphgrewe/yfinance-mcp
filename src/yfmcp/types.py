@@ -1,5 +1,7 @@
 from typing import Literal
 
+DataSource = Literal["auto", "yfinance", "onvista", "eodhd"]
+
 # Error codes for structured error handling
 ErrorCode = Literal[
     "INVALID_SYMBOL",  # Stock symbol not found or invalid

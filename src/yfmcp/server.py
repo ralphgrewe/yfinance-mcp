@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Annotated
 from typing import Any
@@ -14,7 +15,13 @@ from yfinance.const import SECTOR_INDUSTY_MAPPING
 from yfinance.exceptions import YFRateLimitError
 
 from yfmcp.chart import generate_chart
+from yfmcp.providers import ProviderExhaustedError
+from yfmcp.providers import ProviderRegistry
+from yfmcp.providers.eodhd_provider import EodhdProvider
+from yfmcp.providers.onvista_provider import OnvistaProvider
+from yfmcp.providers.yfinance_provider import YFinanceProvider
 from yfmcp.types import ChartType
+from yfmcp.types import DataSource
 from yfmcp.types import Interval
 from yfmcp.types import OptionChainType
 from yfmcp.types import Period
@@ -26,6 +33,35 @@ from yfmcp.utils import dump_json
 
 # https://github.com/jlowin/fastmcp/issues/81#issuecomment-2714245145
 mcp = FastMCP("yfinance_mcp", log_level="ERROR")
+
+
+def _build_registry() -> ProviderRegistry:
+    """Build the provider registry from environment configuration."""
+    order_env = os.getenv("PROVIDER_ORDER", "yfinance,onvista,eodhd")
+    requested_order = [name.strip() for name in order_env.split(",")]
+
+    onvista_delay = float(os.getenv("ONVISTA_DELAY", "0.3"))
+    eodhd_api_key = os.getenv("EODHD_API_KEY", "")
+
+    all_providers: dict[str, Any] = {
+        "yfinance": YFinanceProvider(),
+        "onvista": OnvistaProvider(request_delay=onvista_delay),
+    }
+
+    if eodhd_api_key:
+        all_providers["eodhd"] = EodhdProvider(api_key=eodhd_api_key)
+    else:
+        logger.warning("EODHD_API_KEY not set; eodhd provider disabled")
+
+    ordered: list[Any] = []
+    for name in requested_order:
+        if name in all_providers:
+            ordered.append(all_providers[name])
+
+    return ProviderRegistry(ordered)
+
+
+_registry = _build_registry()
 
 
 _RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
@@ -128,6 +164,17 @@ def _create_option_chain_fetch_error(
 )
 async def get_ticker_info(
     symbol: Annotated[str, Field(description="Stock ticker symbol (e.g., 'AAPL', 'GOOGL', 'MSFT')")],
+    data_source: Annotated[
+        DataSource,
+        Field(
+            description=(
+                "Data provider to use. 'auto' (default) tries providers in order: "
+                "yfinance → onvista → eodhd. "
+                "Use 'onvista' for German/EU small caps not covered by yfinance. "
+                "Use 'eodhd' if an API key is configured (see EODHD_API_KEY env var)."
+            )
+        ),
+    ] = "auto",
 ) -> str:
     """Retrieve comprehensive stock data including company information, financials, trading metrics and governance.
 
@@ -141,12 +188,18 @@ async def get_ticker_info(
     - Performance: beta, fiftyDayAverage, twoHundredDayAverage, trailingEps, forwardEps
 
     Note: Available fields vary by security type. Timestamps are converted to readable dates.
+    The _provider field in the response indicates which data source was used.
     """
     try:
-        ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
-        info = await asyncio.to_thread(lambda: ticker.info)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(f"fetching ticker info for '{symbol}'", exc, {"symbol": symbol})
+        info, provider_used = await _registry.get("get_ticker_info", data_source, symbol=symbol)
+    except ProviderExhaustedError as exc:
+        return create_error_response(
+            f"No information available for symbol '{symbol}'. "
+            "The symbol may be invalid or delisted. Try searching for the company "
+            "name using the 'yfinance_search' tool to find the correct symbol.",
+            error_code="INVALID_SYMBOL",
+            details={"symbol": symbol, "providers_tried": exc.providers_tried},
+        )
     except Exception as exc:
         return create_error_response(
             f"Failed to fetch ticker info for '{symbol}'. Verify the symbol is correct and try again.",
@@ -154,29 +207,19 @@ async def get_ticker_info(
             details={"symbol": symbol, "exception": str(exc)},
         )
 
-    if not info:
-        return create_error_response(
-            f"No information available for symbol '{symbol}'. "
-            "The symbol may be invalid or delisted. Try searching for the company "
-            "name using the 'yfinance_search' tool to find the correct symbol.",
-            error_code="INVALID_SYMBOL",
-            details={"symbol": symbol},
-        )
-
     # Convert timestamps to human-readable format when they look numeric.
     for key, value in list(info.items()):
         if not isinstance(key, str):
             continue
-
         if not isinstance(value, int | float):
             continue
-
         if key.lower().endswith(("date", "start", "end", "timestamp", "time", "quarter")):
             try:
                 info[key] = datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
             except Exception as exc:
                 logger.error("Unable to convert {}: {} to datetime: {}", key, value, exc)
 
+    info["_provider"] = provider_used
     return dump_json(info)
 
 
@@ -621,6 +664,17 @@ async def get_price_history(
         bool,
         Field(description="Include pre-market and post-market data when available"),
     ] = False,
+    data_source: Annotated[
+        DataSource,
+        Field(
+            description=(
+                "Data provider to use. 'auto' (default) tries providers in order: "
+                "yfinance → onvista → eodhd. "
+                "Use 'onvista' for German/EU small caps not covered by yfinance. "
+                "Use 'eodhd' if an API key is configured (see EODHD_API_KEY env var)."
+            )
+        ),
+    ] = "auto",
 ) -> str | ImageContent:
     """Fetch historical price data and optionally generate technical analysis charts.
 
@@ -643,31 +697,31 @@ async def get_price_history(
 
     Note: Not all period/interval combinations are valid. Minute intervals (1m, 5m, etc.)
     only work with short periods (1d, 5d).
+    The _provider field in the response (tabular mode) indicates which data source was used.
     """
     try:
-        if prepost:
-            # yfcache does not support pre/post market data; fall back to plain yfinance
-            ticker = await asyncio.to_thread(yf.Ticker, symbol)
-            df = await asyncio.to_thread(
-                ticker.history,
-                period=period,
-                interval=interval,
-                prepost=prepost,
-                rounding=True,
-            )
-        else:
-            ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
-            df = await asyncio.to_thread(
-                ticker.history,
-                period=period,
-                interval=interval,
-                rounding=True,
-            )
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(
-            f"fetching price history for '{symbol}'",
-            exc,
-            {"symbol": symbol, "period": period, "interval": interval, "prepost": prepost},
+        records, provider_used = await _registry.get(
+            "get_price_history",
+            data_source,
+            symbol=symbol,
+            period=period,
+            interval=interval,
+            prepost=prepost,
+        )
+    except ProviderExhaustedError as exc:
+        return create_error_response(
+            f"No price data available for '{symbol}' with period='{period}' and interval='{interval}'. "
+            "Common issues: (1) Invalid symbol, (2) Incompatible period/interval combination "
+            "(e.g., '1m' interval requires '1d' or '5d' period), (3) Market holidays or insufficient history. "
+            "Try a longer period or daily interval.",
+            error_code="NO_DATA",
+            details={
+                "symbol": symbol,
+                "period": period,
+                "interval": interval,
+                "prepost": prepost,
+                "providers_tried": exc.providers_tried,
+            },
         )
     except Exception as exc:
         return create_error_response(
@@ -683,18 +737,42 @@ async def get_price_history(
             },
         )
 
-    if df.empty:
+    if chart_type is None:
+        return dump_json(records)
+
+    # For chart generation we need a DataFrame; re-fetch via yfinance directly
+    # (chart rendering is yfinance-specific and always uses yfinance data)
+    try:
+        if prepost:
+            ticker_obj = await asyncio.to_thread(yf.Ticker, symbol)
+            df = await asyncio.to_thread(
+                ticker_obj.history,
+                period=period,
+                interval=interval,
+                prepost=prepost,
+                rounding=True,
+            )
+        else:
+            ticker_obj = await asyncio.to_thread(yfcache.Ticker, symbol)
+            df = await asyncio.to_thread(
+                ticker_obj.history,
+                period=period,
+                interval=interval,
+                rounding=True,
+            )
+    except Exception as exc:
         return create_error_response(
-            f"No price data available for '{symbol}' with period='{period}' and interval='{interval}'. "
-            "Common issues: (1) Invalid symbol, (2) Incompatible period/interval combination "
-            "(e.g., '1m' interval requires '1d' or '5d' period), (3) Market holidays or insufficient history. "
-            "Try a longer period or daily interval.",
-            error_code="NO_DATA",
-            details={"symbol": symbol, "period": period, "interval": interval, "prepost": prepost},
+            f"Failed to fetch price history for chart generation for '{symbol}'.",
+            error_code="API_ERROR",
+            details={"symbol": symbol, "exception": str(exc)},
         )
 
-    if chart_type is None:
-        return dump_json(df.reset_index().to_dict(orient="records"))
+    if df.empty:
+        return create_error_response(
+            f"No price data available for '{symbol}' for chart generation.",
+            error_code="NO_DATA",
+            details={"symbol": symbol, "period": period, "interval": interval},
+        )
 
     return generate_chart(symbol=symbol, df=df, chart_type=chart_type)
 
@@ -719,32 +797,25 @@ async def get_financials(
             )
         ),
     ] = "annual",
+    data_source: Annotated[
+        DataSource,
+        Field(
+            description=(
+                "Data provider to use. 'auto' (default) tries providers in order: "
+                "yfinance → onvista → eodhd. "
+                "Use 'onvista' for German/EU small caps not covered by yfinance. "
+                "Use 'eodhd' if an API key is configured (see EODHD_API_KEY env var)."
+            )
+        ),
+    ] = "auto",
 ) -> str:
     """Fetch financial statements (income statement, balance sheet, and cash flow) with historical data.
 
     Returns JSON with income statement, balance sheet, and cash flow data across reporting periods.
 
     Use the data to analyze trends, calculate ratios, or compare periods.
+    The _provider field in the response indicates which data source was used.
     """
-    try:
-        # yfcache does not have ttm_income_stmt; fall back to plain yfinance for ttm frequency
-        if frequency == "ttm":
-            ticker = await asyncio.to_thread(yf.Ticker, symbol)
-        else:
-            ticker = await asyncio.to_thread(yfcache.Ticker, symbol)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(f"fetching financials for '{symbol}'", exc, {"symbol": symbol})
-    except Exception as exc:
-        return create_error_response(
-            f"Failed to fetch financials for '{symbol}'. Verify the symbol is correct.",
-            error_code="API_ERROR",
-            details={"symbol": symbol, "exception": str(exc)},
-        )
-
-    income_stmt = None
-    balance_sheet = None
-    cash_flow = None
-
     if frequency not in {"annual", "quarterly", "ttm"}:
         return create_error_response(
             f"Invalid frequency '{frequency}'. Valid options: 'annual', 'quarterly', 'ttm'.",
@@ -753,25 +824,17 @@ async def get_financials(
         )
 
     try:
-        if frequency == "annual":
-            income_stmt = await asyncio.to_thread(lambda: ticker.income_stmt)
-            balance_sheet = await asyncio.to_thread(lambda: ticker.balance_sheet)
-            cash_flow = await asyncio.to_thread(lambda: ticker.cashflow)
-        elif frequency == "quarterly":
-            income_stmt = await asyncio.to_thread(lambda: ticker.quarterly_income_stmt)
-            balance_sheet = await asyncio.to_thread(lambda: ticker.quarterly_balance_sheet)
-            cash_flow = await asyncio.to_thread(lambda: ticker.quarterly_cashflow)
-        else:
-            income_stmt = await asyncio.to_thread(lambda: ticker.ttm_income_stmt)
-            balance_sheet = None  # TTM balance sheet not directly available
-            cash_flow = None  # TTM cash flow not directly available
-
-        result = _build_financials_response(income_stmt, balance_sheet, cash_flow)
-    except _RETRYABLE_YFINANCE_EXCEPTIONS as exc:
-        return _create_retryable_error_response(
-            f"fetching financials for '{symbol}'",
-            exc,
-            {"symbol": symbol, "frequency": frequency},
+        result, provider_used = await _registry.get(
+            "get_financials",
+            data_source,
+            symbol=symbol,
+            frequency=frequency,
+        )
+    except ProviderExhaustedError as exc:
+        return create_error_response(
+            f"No financial data available for '{symbol}' with frequency='{frequency}'.",
+            error_code="NO_DATA",
+            details={"symbol": symbol, "frequency": frequency, "providers_tried": exc.providers_tried},
         )
     except Exception as exc:
         return create_error_response(
@@ -779,17 +842,12 @@ async def get_financials(
             error_code="API_ERROR",
             details={"symbol": symbol, "frequency": frequency, "exception": str(exc)},
         )
-    if not result:
-        return create_error_response(
-            f"No financial data available for '{symbol}' with frequency='{frequency}'.",
-            error_code="NO_DATA",
-            details={"symbol": symbol, "frequency": frequency},
-        )
 
+    result["_provider"] = provider_used
     return dump_json(result)
 
 
-def _build_financials_response(income_stmt, balance_sheet, cash_flow=None) -> dict:
+def _build_financials_response(income_stmt: Any, balance_sheet: Any, cash_flow: Any = None) -> dict:
     """Build financials response from income statement, balance sheet, and cash flow DataFrames."""
     result = {}
 
